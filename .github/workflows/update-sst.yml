@@ -1,0 +1,43 @@
+name: Update Japan Sea Surface Temperature
+
+on:
+  schedule:
+    - cron: "0 21 * * *"
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-japan-sst
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Collect sea surface temperature
+        run: python collect_sst.py
+
+      - name: Save updated data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/japan_sst.csv
+          if ! git diff --cached --quiet; then
+            git commit -m "Update Japan sea surface temperature data"
+            git push
+          else
+            echo "No data changes"
+          fi
