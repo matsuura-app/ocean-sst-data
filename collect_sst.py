@@ -32,32 +32,63 @@ FIELDS = [
 os.makedirs("data", exist_ok=True)
 
 now = datetime.now(JST)
-fetched_at = now.isoformat(timespec="seconds")
-cutoff = now - timedelta(days=5)
+today = now.date()
+yesterday = today - timedelta(days=1)
+cutoff_date = today - timedelta(days=4)
 
-# 既存データを読み込む
+fetched_at = now.isoformat(timespec="seconds")
+
+# 既存CSVから直近5日分を引き継ぐ
 records = {}
 
 if os.path.exists(CSV_FILE):
     with open(CSV_FILE, newline="", encoding="utf-8") as f:
         for row in csv.DictReader(f):
             try:
-                data_time = datetime.fromisoformat(row["data_time"])
-                if data_time.tzinfo is None:
-                    data_time = data_time.replace(tzinfo=JST)
+                dt = datetime.fromisoformat(row["data_time"])
 
-                if cutoff <= data_time <= now:
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=JST)
+                else:
+                    dt = dt.astimezone(JST)
+
+                if cutoff_date <= dt.date() <= today:
                     key = (
                         row["data_time"],
                         row["latitude"],
                         row["longitude"]
                     )
                     records[key] = row
+
             except (ValueError, KeyError):
                 continue
 
+# 既存データの日付を確認
+existing_dates = set()
+
+for row in records.values():
+    try:
+        dt = datetime.fromisoformat(row["data_time"])
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=JST)
+        else:
+            dt = dt.astimezone(JST)
+        existing_dates.add(dt.date())
+    except ValueError:
+        continue
+
+# 5日分が揃っていない場合は初回補完
+if not existing_dates or min(existing_dates) > cutoff_date:
+    fetch_start_date = cutoff_date
+    print("初回補完モード: 最新5日分を取得")
+else:
+    fetch_start_date = yesterday
+    print("通常更新モード: 前日・当日を取得")
+
 print("取得地点:", len(points))
 print("既存データ:", len(records))
+print("取得期間:", fetch_start_date, "〜", today)
+print("保存対象:", cutoff_date, "〜", today)
 print("取得開始:", fetched_at)
 
 success_batches = 0
@@ -65,6 +96,7 @@ failed_batches = 0
 new_records = 0
 updated_records = 0
 
+# 前日と当日の2日分だけ取得
 for start in range(0, len(points), BATCH_SIZE):
     batch = points[start:start + BATCH_SIZE]
 
@@ -72,7 +104,8 @@ for start in range(0, len(points), BATCH_SIZE):
         "latitude": ",".join(str(p[0]) for p in batch),
         "longitude": ",".join(str(p[1]) for p in batch),
         "hourly": "sea_surface_temperature",
-        "past_days": 5,
+        "start_date": fetch_start_date.isoformat(),
+        "end_date": today.isoformat(),
         "forecast_days": 0,
         "timezone": "Asia/Tokyo",
         "cell_selection": "sea"
@@ -89,7 +122,9 @@ for start in range(0, len(points), BATCH_SIZE):
         try:
             req = urllib.request.Request(
                 url,
-                headers={"User-Agent": "JapanSSTDataCollector/1.0"}
+                headers={
+                    "User-Agent": "JapanSSTDataCollector/1.0"
+                }
             )
 
             with urllib.request.urlopen(req, timeout=120) as response:
@@ -125,6 +160,7 @@ for start in range(0, len(points), BATCH_SIZE):
 
         item = data[i]
         hourly = item.get("hourly", {})
+
         times = hourly.get("time", [])
         temperatures = hourly.get("sea_surface_temperature", [])
 
@@ -140,11 +176,18 @@ for start in range(0, len(points), BATCH_SIZE):
 
             try:
                 dt = datetime.fromisoformat(data_time)
+
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=JST)
+                else:
+                    dt = dt.astimezone(JST)
 
-                if dt < cutoff or dt > now:
+                if dt.date() < fetch_start_date or dt.date() > today:
                     continue
+
+                if dt > now:
+                    continue
+
             except ValueError:
                 continue
 
@@ -187,13 +230,40 @@ for start in range(0, len(points), BATCH_SIZE):
     if start + BATCH_SIZE < len(points):
         time.sleep(WAIT_SECONDS)
 
-# CSVを保存
-with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
+# 1バッチでも失敗した場合は既存CSVを変更しない
+if failed_batches > 0:
+    print("--------------------------------")
+    print("❌ 取得失敗のためCSVは更新しません")
+    print("失敗バッチ:", failed_batches)
+    raise SystemExit(1)
+
+# 日本時間で直近5日分に整理
+final_records = {}
+
+for key, row in records.items():
+    try:
+        dt = datetime.fromisoformat(row["data_time"])
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=JST)
+        else:
+            dt = dt.astimezone(JST)
+
+        if cutoff_date <= dt.date() <= today and dt <= now:
+            final_records[key] = row
+
+    except (ValueError, KeyError):
+        continue
+
+# 一時ファイルに保存してから置き換える
+temp_file = CSV_FILE + ".tmp"
+
+with open(temp_file, "w", newline="", encoding="utf-8") as f:
     writer = csv.DictWriter(f, fieldnames=FIELDS)
     writer.writeheader()
     writer.writerows(
         sorted(
-            records.values(),
+            final_records.values(),
             key=lambda r: (
                 r["data_time"],
                 float(r["latitude"]),
@@ -202,12 +272,14 @@ with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
         )
     )
 
+os.replace(temp_file, CSV_FILE)
+
 print("--------------------------------")
-print("処理終了")
+print("✅ 処理終了")
 print("成功バッチ:", success_batches)
-print("失敗バッチ:", failed_batches)
 print("新規データ:", new_records)
 print("水温更新:", updated_records)
-print("保存データ数:", len(records))
+print("保存データ数:", len(final_records))
+print("保存期間:", cutoff_date, "〜", today)
 print("CSV保存先:", CSV_FILE)
 print("取得日時:", fetched_at)
